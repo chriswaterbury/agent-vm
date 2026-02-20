@@ -8,10 +8,117 @@
 #
 # Functions:
 #   claude-vm-setup  - Create the VM template (run once)
-#   claude-vm [args] - Run Claude in a fresh VM with cwd mounted (args forwarded to claude)
-#   claude-vm-shell  - Open a debug shell in a fresh VM
+#   claude-vm-sync   - Fetch/update claude-flow CLAUDE.md and .claude/ to ~/.claude-vm.d/
+#   claude-vm        - Open an interactive shell in a fresh VM with cwd mounted and worktree
+#   claude-vm-shell  - Open a debug shell in a fresh VM (no worktree)
+#   claude-vm-close  - Finalize or dismiss a branch from a previous claude-vm session
 
 CLAUDE_VM_TEMPLATE="claude-template"
+
+# ─── claude-flow file sync & injection ────────────────────────────────────────
+
+# claude-vm-sync: Fetch (or refresh) claude-flow's CLAUDE.md and .claude/ from
+# GitHub into ~/.claude-vm.d/claude-flow/ on the host.  Re-run to update.
+claude-vm-sync() {
+  local dest="$HOME/.claude-vm.d/claude-flow"
+  local tmp
+  tmp="$(mktemp -d)"
+  echo "Syncing claude-flow files from GitHub..."
+  git clone --depth=1 --filter=blob:none --sparse \
+    https://github.com/ruvnet/claude-flow.git "$tmp" 2>&1 | tail -1
+  git -C "$tmp" sparse-checkout set CLAUDE.md .claude &>/dev/null
+  mkdir -p "$dest"
+  cp "$tmp/CLAUDE.md" "$dest/CLAUDE.md"
+  rsync -a "$tmp/.claude/" "$dest/.claude/"
+  rm -rf "$tmp"
+  echo "Synced to $dest"
+}
+
+# _claude_vm_inject_flow TARGET_DIR
+# Copy claude-flow templates into a project dir before the VM starts.
+# CLAUDE.md: copy if absent; if present, prepend an @import line.
+# .claude/:  rsync with --ignore-existing so project files are never overwritten.
+_claude_vm_inject_flow() {
+  local target_dir="$1"
+  local cf="$HOME/.claude-vm.d/claude-flow"
+
+  if [ ! -d "$cf" ]; then
+    echo "claude-flow files not found locally; running claude-vm-sync..."
+    claude-vm-sync
+  fi
+
+  if [ ! -f "$target_dir/CLAUDE.md" ]; then
+    cp "$cf/CLAUDE.md" "$target_dir/CLAUDE.md"
+  else
+    if ! grep -qF "claude-vm.d/claude-flow/CLAUDE.md" "$target_dir/CLAUDE.md"; then
+      local tmp_md
+      tmp_md="$(mktemp)"
+      printf '@%s/CLAUDE.md\n\n' "$cf" | cat - "$target_dir/CLAUDE.md" > "$tmp_md"
+      mv "$tmp_md" "$target_dir/CLAUDE.md"
+    fi
+  fi
+
+  if [ -d "$cf/.claude" ]; then
+    mkdir -p "$target_dir/.claude"
+    rsync -a --ignore-existing "$cf/.claude/" "$target_dir/.claude/"
+  fi
+}
+
+# _claude_vm_accumulate_flow SOURCE_DIR
+# After a session, copy any NEW .claude/ files the agent created back into the
+# global store (--ignore-existing, so upstream templates are never overwritten).
+_claude_vm_accumulate_flow() {
+  local source_dir="$1"
+  local cf="$HOME/.claude-vm.d/claude-flow"
+  if [ -d "$source_dir/.claude" ] && [ -d "$cf/.claude" ]; then
+    rsync -a --ignore-existing "$source_dir/.claude/" "$cf/.claude/"
+  fi
+}
+
+# ─── persistent memory helpers ────────────────────────────────────────────────
+# Each session gets a private copy of the accumulated memory state so that
+# concurrent sessions never write to the same files.  On exit the session's
+# state is merged back into the shared base/ directory under flock.
+
+# _claude_vm_memory_setup PROJECT_NAME VM_NAME
+# Creates a private session memory dir pre-populated from the project base.
+# Prints the session dir path (for use as a Lima mount).
+_claude_vm_memory_setup() {
+  local project_name="$1"
+  local vm_name="$2"
+  local base_dir="$HOME/.claude-vm.d/memory/${project_name}/base"
+  local session_dir="$HOME/.claude-vm.d/memory/${project_name}/sessions/${vm_name}"
+  mkdir -p "$base_dir" "$session_dir"
+  rsync -a "$base_dir/" "$session_dir/" 2>/dev/null || true
+  echo "$session_dir"
+}
+
+# _claude_vm_memory_merge PROJECT_NAME VM_NAME
+# Merges the session memory back into base/ under an exclusive lock, then
+# removes the session directory.
+_claude_vm_memory_merge() {
+  local project_name="$1"
+  local vm_name="$2"
+  local base_dir="$HOME/.claude-vm.d/memory/${project_name}/base"
+  local session_dir="$HOME/.claude-vm.d/memory/${project_name}/sessions/${vm_name}"
+  local lockdir="$HOME/.claude-vm.d/memory/${project_name}/.merge.lock.d"
+  if [ -d "$session_dir" ]; then
+    # Atomic mkdir lock — portable to macOS/zsh, no flock needed
+    local retries=30
+    while ! mkdir "$lockdir" 2>/dev/null; do
+      retries=$((retries - 1))
+      if [ "$retries" -le 0 ]; then
+        echo "Warning: could not acquire memory merge lock; skipping merge." >&2
+        return 1
+      fi
+      sleep 1
+    done
+    rsync -a --ignore-existing "$session_dir/" "$base_dir/"
+    rsync -a -u "$session_dir/" "$base_dir/"
+    rmdir "$lockdir"
+    rm -rf "$session_dir"
+  fi
+}
 
 claude-vm-setup() {
   local minimal=false
@@ -116,7 +223,6 @@ claude-vm-setup() {
     echo "Installing Node.js 22..."
     limactl shell "$CLAUDE_VM_TEMPLATE" bash -c "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -"
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
-
     # Install Chromium and dependencies for headless browsing
     echo "Installing Chromium..."
     limactl shell "$CLAUDE_VM_TEMPLATE" sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
@@ -137,6 +243,11 @@ claude-vm-setup() {
   # Authenticate Claude (saves token in template, inherited by clones)
   echo "Setting up Claude authentication..."
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc "claude 'Ok I am logged in, I can exit now.'"
+
+  # Install claude-flow (multi-agent orchestration)
+  echo "Installing claude-flow..."
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc "npm install -g ruflo@alpha -f"
+
 
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
@@ -176,25 +287,92 @@ VMEOF
 }
 
 claude-vm() {
-  local args=("$@")
-  local vm_name="claude-$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')-$$"
+  local branch_name=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch)
+        branch_name="$2"
+        shift 2
+        ;;
+      --branch=*)
+        branch_name="${1#*=}"
+        shift
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        echo "Usage: claude-vm [--branch name]" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  local project_name
+  project_name="$(basename "$(pwd)" | tr -cs 'a-zA-Z0-9' '-' | sed 's/^-//;s/-$//')"
+  local vm_name="claude-${project_name}-$$"
   local host_dir="$(pwd)"
+  local mount_dir="$host_dir"
+  local worktree_dir=""
 
   if ! limactl list -q 2>/dev/null | grep -q "^${CLAUDE_VM_TEMPLATE}$"; then
     echo "Error: Template VM not found. Run 'claude-vm-setup' first." >&2
     return 1
   fi
 
+  # If inside a git repo, create a worktree on a new branch
+  if git rev-parse --is-inside-work-tree &>/dev/null; then
+    if [ -z "$branch_name" ]; then
+      branch_name="claude/${project_name}-$(date +%Y%m%d-%H%M%S)"
+    fi
+
+    worktree_dir="$(mktemp -d "${TMPDIR:-/tmp}/claude-worktree-XXXXXX")"
+    echo "Creating worktree on branch '$branch_name'..."
+    if ! git worktree add "$worktree_dir" -b "$branch_name"; then
+      echo "Error: Failed to create git worktree." >&2
+      rm -rf "$worktree_dir"
+      return 1
+    fi
+    mount_dir="$worktree_dir"
+  fi
+
+  # Inject claude-flow CLAUDE.md and .claude/ into the project dir
+  _claude_vm_inject_flow "$mount_dir"
+
+  # Set up per-session memory directory (safe for concurrent sessions)
+  local session_memory_dir
+  session_memory_dir="$(_claude_vm_memory_setup "$project_name" "$vm_name")"
+
   _claude_vm_cleanup() {
     echo "Cleaning up VM..."
     limactl stop "$vm_name" &>/dev/null
     limactl delete "$vm_name" --force &>/dev/null
+    if [ -n "$worktree_dir" ]; then
+      # Accumulate any new .claude/ files the agent created back to global store
+      _claude_vm_accumulate_flow "$mount_dir"
+      # Merge session memory back to the shared base (serialized via flock)
+      _claude_vm_memory_merge "$project_name" "$vm_name"
+      # Auto-commit any uncommitted changes so they aren't lost
+      if git -C "$worktree_dir" diff --quiet && git -C "$worktree_dir" diff --cached --quiet; then
+        : # nothing to commit
+      else
+        echo "Committing uncommitted changes on branch '$branch_name'..."
+        git -C "$worktree_dir" add -A
+        git -C "$worktree_dir" commit -m "wip: uncommitted changes from claude-vm session" --no-verify &>/dev/null
+      fi
+      echo "Removing worktree..."
+      git -C "$host_dir" worktree remove "$worktree_dir" --force &>/dev/null
+      echo "Branch '$branch_name' is available for review."
+    else
+      # Not a git repo — still accumulate and merge memory
+      _claude_vm_accumulate_flow "$mount_dir"
+      _claude_vm_memory_merge "$project_name" "$vm_name"
+    fi
   }
   trap _claude_vm_cleanup EXIT INT TERM
 
   echo "Starting VM '$vm_name'..."
   limactl clone "$CLAUDE_VM_TEMPLATE" "$vm_name" \
-    --set ".mounts=[{\"location\":\"${host_dir}\",\"writable\":true}]" \
+    --set ".mounts=[{\"location\":\"${mount_dir}\",\"writable\":true},{\"location\":\"${session_memory_dir}\",\"writable\":true}]" \
     --tty=false &>/dev/null
 
   limactl start "$vm_name" &>/dev/null
@@ -202,10 +380,24 @@ claude-vm() {
   # Run project-specific runtime script if it exists
   if [ -f "${host_dir}/.claude-vm.runtime.sh" ]; then
     echo "Running project runtime setup..."
-    limactl shell --workdir "$host_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
+    limactl shell --workdir "$mount_dir" "$vm_name" bash -l < "${host_dir}/.claude-vm.runtime.sh"
   fi
 
-  limactl shell --workdir "$host_dir" "$vm_name" claude --dangerously-skip-permissions "${args[@]}"
+  echo ""
+  echo "=============================================="
+  echo "  agent-vm session"
+  echo "  Branch : ${branch_name:-none (not a git repo)}"
+  echo "  Dir    : $mount_dir"
+  echo ""
+  echo "  Available tools:"
+  echo "    ruflo    Multi-agent orchestration (ruflo --help)"
+  echo "    claude   Standard Claude Code (claude --help)"
+  echo ""
+  echo "  Type 'exit' when done."
+  echo "  Uncommitted changes will be auto-saved as a WIP commit."
+  echo "=============================================="
+  echo ""
+  limactl shell --workdir "$mount_dir" "$vm_name" bash -l
 
   _claude_vm_cleanup
   trap - EXIT INT TERM
@@ -244,4 +436,103 @@ claude-vm-shell() {
 
   _claude_vm_shell_cleanup
   trap - EXIT INT TERM
+}
+
+claude-vm-close() {
+  local branch_name="$1"
+
+  if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "Error: Not inside a git repository." >&2
+    return 1
+  fi
+
+  # If no branch given, list claude/* branches and let user choose
+  if [ -z "$branch_name" ]; then
+    local -a branches=()
+    while IFS= read -r b; do
+      branches+=("$b")
+    done < <(git branch --list 'claude/*' | sed 's/^[* ]*//')
+
+    if [ ${#branches[@]} -eq 0 ]; then
+      echo "No claude/* branches found." >&2
+      return 1
+    fi
+
+    if [ ${#branches[@]} -eq 1 ]; then
+      branch_name="${branches[0]}"
+      echo "Using branch: $branch_name"
+    else
+      echo "Select a branch to close:"
+      select branch_name in "${branches[@]}"; do
+        [ -n "$branch_name" ] && break
+        echo "Invalid selection." >&2
+      done
+    fi
+  fi
+
+  if ! git show-ref --verify --quiet "refs/heads/$branch_name"; then
+    echo "Error: Branch '$branch_name' not found." >&2
+    return 1
+  fi
+
+  local tip_msg
+  tip_msg="$(git log -1 --pretty=%s "$branch_name")"
+
+  echo ""
+  echo "Branch : $branch_name"
+  echo "Tip    : $tip_msg"
+  echo ""
+  echo "  [d] Dismiss  - delete branch and discard all changes"
+  echo "  [f] Finalize - write a commit message and close out the branch"
+  echo ""
+  printf "Choice [d/f]: "
+  local choice
+  read -r choice
+
+  case "$choice" in
+    d|D)
+      printf "Delete '%s' and discard all changes? [y/N]: " "$branch_name"
+      local confirm
+      read -r confirm
+      if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        git branch -D "$branch_name"
+        echo "Branch '$branch_name' deleted."
+      else
+        echo "Aborted."
+      fi
+      ;;
+    f|F)
+      printf "Commit message: "
+      local msg
+      read -r msg
+      if [ -z "$msg" ]; then
+        echo "Aborted: empty commit message." >&2
+        return 1
+      fi
+
+      local tmp_wt
+      tmp_wt="$(mktemp -d "${TMPDIR:-/tmp}/claude-close-XXXXXX")"
+      if ! git worktree add "$tmp_wt" "$branch_name" &>/dev/null; then
+        echo "Error: could not create temporary worktree." >&2
+        rm -rf "$tmp_wt"
+        return 1
+      fi
+
+      if [ "$tip_msg" = "wip: uncommitted changes from claude-vm session" ]; then
+        git -C "$tmp_wt" commit --amend -m "$msg" --no-verify
+      else
+        git -C "$tmp_wt" commit --allow-empty -m "$msg" --no-verify
+      fi
+
+      git worktree remove "$tmp_wt" --force &>/dev/null
+
+      echo ""
+      echo "Branch '$branch_name' finalized."
+      echo "  Merge locally : git merge $branch_name"
+      echo "  Open a PR     : gh pr create --head $branch_name"
+      ;;
+    *)
+      echo "Aborted."
+      ;;
+  esac
 }
