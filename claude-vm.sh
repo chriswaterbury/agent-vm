@@ -246,7 +246,7 @@ claude-vm-setup() {
 
   # Install claude-flow (multi-agent orchestration)
   echo "Installing claude-flow..."
-  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc "npm install -g ruflo@alpha -f"
+  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc "curl -fsSL https://cdn.jsdelivr.net/gh/ruvnet/claude-flow@main/scripts/install.sh | bash -s -- --full"
 
 
   if ! $minimal; then
