@@ -244,10 +244,6 @@ claude-vm-setup() {
   echo "Setting up Claude authentication..."
   limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc "claude 'Ok I am logged in, I can exit now.'"
 
-  # Install claude-flow (multi-agent orchestration)
-  echo "Installing claude-flow..."
-  limactl shell "$CLAUDE_VM_TEMPLATE" bash -lc "npx -y claude-flow@latest --full"
-
 
   if ! $minimal; then
     # Configure Chrome DevTools MCP server for Claude
@@ -412,7 +408,7 @@ claude-vm() {
   echo "  Uncommitted changes will be auto-saved as a WIP commit."
   echo "=============================================="
   echo ""
-  limactl shell --workdir "$mount_dir" "$vm_name" bash -lc "npx claude-flow start && claude --dangerously-skip-permissions"
+  limactl shell --workdir "$mount_dir" "$vm_name" bash -lc "npx --yes claude-flow init --full && npx --yes claude-flow start && claude --dangerously-skip-permissions"
 
   _claude_vm_cleanup
   trap - EXIT INT TERM
