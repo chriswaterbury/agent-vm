@@ -335,6 +335,16 @@ claude-vm() {
     mount_dir="$worktree_dir"
   fi
 
+  # Stash the worktree .git file so the VM sees a clean directory.
+  # Inside the VM the worktree's .git FILE would point to a host path that
+  # doesn't exist in the VM, breaking all git commands.  We restore it on
+  # cleanup so we can still commit back to the branch from the host.
+  local worktree_git_bak=""
+  if [ -n "$worktree_dir" ] && [ -f "$worktree_dir/.git" ]; then
+    worktree_git_bak="${worktree_dir}/.git.bak"
+    mv "$worktree_dir/.git" "$worktree_git_bak"
+  fi
+
   # Inject claude-flow CLAUDE.md and .claude/ into the project dir
   _claude_vm_inject_flow "$mount_dir"
 
@@ -351,6 +361,11 @@ claude-vm() {
       _claude_vm_accumulate_flow "$mount_dir"
       # Merge session memory back to the shared base (serialized via flock)
       _claude_vm_memory_merge "$project_name" "$vm_name"
+      # Restore the .git file the VM couldn't see, removing any .git the agent created
+      if [ -n "$worktree_git_bak" ] && [ -f "$worktree_git_bak" ]; then
+        rm -rf "$worktree_dir/.git"
+        mv "$worktree_git_bak" "$worktree_dir/.git"
+      fi
       # Auto-commit any uncommitted changes so they aren't lost
       if git -C "$worktree_dir" diff --quiet && git -C "$worktree_dir" diff --cached --quiet; then
         : # nothing to commit
